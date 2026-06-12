@@ -451,11 +451,10 @@ Suggest changes with explanations (for review/feedback requests).""",
     "generate_image": """\
 ```generate_image
 <prompt>
-
 <size>
 <quality>
 ```
-Generate an image. Line 1 = description, line 2 = LEAVE BLANK (the server picks the installed image model — do not name a model), line 3 = WxH (e.g. 1024x1024), line 4 = quality.""",
+Generate an image. Line 1 = description, line 2 = WxH (e.g. 1024x1024), line 3 = quality. The server picks the installed image model automatically — do not name a model.""",
 
     "chat_with_model": "- ```chat_with_model``` — Ask a DIFFERENT AI model and relay its answer. Line 1 = model name (or 'model@endpoint'), rest = your message. Use when the user says 'ask <model>', 'what does <model> think', or wants to compare/their answer from another model.",
     "ask_teacher": "- ```ask_teacher``` — Escalate a hard question to a more capable model. Line 1 = model name or 'auto', rest = the question. Use when stuck or need expert knowledge.",
@@ -3276,6 +3275,17 @@ async def stream_agent_loop(
     # so the user can resume instead of the turn silently stalling.
     _exhausted_rounds = False
 
+    # Installed image models for the generate_image enum (Fix: stop the agent
+    # inventing model names). Computed ONCE per turn (turn-invariant) and off the
+    # event loop so a slow/down image endpoint can't stall it; the per-round
+    # schema injection below just reuses this. Empty on failure -> enum omitted.
+    _image_model_ids = []
+    try:
+        from src.ai_interaction import list_image_model_ids
+        _image_model_ids = await asyncio.to_thread(list_image_model_ids, owner)
+    except Exception as _img_e:
+        logger.debug(f"image-model list lookup skipped: {_img_e}")
+
     for round_num in range(1, max_rounds + 1):
         round_response = ""
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
@@ -3333,13 +3343,12 @@ async def stream_agent_loop(
                     and t.get("name") not in disabled_tools
                 ]
             # Constrain generate_image's `model` param to the actually-installed
-            # image models so the agent can't invent a name the backend lacks
-            # (which hard-fails at resolution). Fails open if none are found.
-            if any(t.get("function", {}).get("name") == "generate_image" for t in all_tool_schemas):
+            # image models (computed once per turn above) so the agent can't
+            # invent a name the backend lacks. Fails open if none are found.
+            if _image_model_ids and any(t.get("function", {}).get("name") == "generate_image" for t in all_tool_schemas):
                 try:
-                    from src.ai_interaction import list_image_model_ids
                     from src.tool_schemas import with_image_model_enum
-                    all_tool_schemas = with_image_model_enum(all_tool_schemas, list_image_model_ids(owner))
+                    all_tool_schemas = with_image_model_enum(all_tool_schemas, _image_model_ids)
                 except Exception as _enum_e:
                     logger.debug(f"image-model enum injection skipped: {_enum_e}")
         else:

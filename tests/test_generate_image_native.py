@@ -66,15 +66,32 @@ def test_native_call_prompt_only():
     assert _parse_generate_image(block.content) == {"prompt": "a fox"}
 
 
-def test_fenced_four_line_form_still_parses():
-    """Back-compat: local/fenced models deliver the 4-line text form."""
-    content = "a sunset over mountains\nQwen-Image-NVFP4\n1024x1024\nhigh"
+def test_fenced_three_line_form_prompt_size_quality():
+    """Fenced/local models deliver prompt / size / quality — NO model line (the
+    server auto-selects the model). Positions map directly so a model can't end
+    up in `model`."""
+    content = "a sunset over mountains\n1024x1024\nhigh"
     assert _parse_generate_image(content) == {
         "prompt": "a sunset over mountains",
-        "model": "Qwen-Image-NVFP4",
         "size": "1024x1024",
         "quality": "high",
     }
+
+
+def test_fenced_prompt_and_size_only():
+    """Quality omitted — prompt + size still align (size is line 2, not model)."""
+    assert _parse_generate_image("a wide landscape\n1536x1024") == {
+        "prompt": "a wide landscape",
+        "size": "1536x1024",
+    }
+
+
+def test_fenced_size_never_lands_in_model_slot():
+    """Regression for the old positional model slot: a size on line 2 must be
+    parsed as size, never as a (then-unresolvable) model name."""
+    args = _parse_generate_image("a castle at dusk\n1792x1024\nhigh")
+    assert "model" not in args
+    assert args["size"] == "1792x1024" and args["quality"] == "high"
 
 
 def test_fenced_prompt_only_still_parses():

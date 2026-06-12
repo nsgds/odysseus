@@ -184,14 +184,11 @@ def list_image_model_ids(owner: Optional[str] = None) -> list:
     if cached and (now - cached[0]) < _IMAGE_MODELS_TTL:
         return list(cached[1])
 
-    ids: list = []
-    try:
-        from src.settings import get_setting
-        configured = (get_setting("image_model", "") or "").strip()
-        if configured:
-            ids.append(configured)
-    except Exception:
-        pass
+    # Probe what the enabled image endpoints actually serve (authenticated — mirror
+    # _resolve_model so auth-gated cloud endpoints aren't silently dropped). These
+    # are the real, valid ids; case-insensitive dedup avoids near-duplicates.
+    probed: list = []
+    seen = set()
     try:
         import httpx as _req
         from src.database import SessionLocal, ModelEndpoint
@@ -205,22 +202,38 @@ def list_image_model_ids(owner: Optional[str] = None) -> list:
             if owner:
                 q = owner_filter(q, ModelEndpoint, owner)
             for ep in q.all():
-                base = ep.base_url.rstrip("/")
-                if not base.endswith("/v1"):
-                    base += "/v1"
                 try:
-                    r = _req.get(base + "/models", timeout=3)
+                    base, api_key = resolve_endpoint_runtime(ep, owner=owner)
+                    murl = build_models_url(base)
+                    if not murl:
+                        continue
+                    r = _req.get(murl, headers=build_headers(api_key, base), timeout=3)
                     r.raise_for_status()
                     for m in (r.json().get("data") or []):
                         mid = m.get("id")
-                        if mid and mid not in ids:
-                            ids.append(mid)
+                        if mid and mid.lower() not in seen:
+                            seen.add(mid.lower())
+                            probed.append(mid)
                 except Exception:
                     continue
         finally:
             _db.close()
     except Exception:
         pass
+
+    # Prefer the actually-served ids. Only when probing yields nothing (endpoint
+    # down/unauthorized) fall back to the admin-configured model so the tool is
+    # never blocked — but don't advertise an unvalidated/stale configured name
+    # alongside real ids.
+    if probed:
+        ids = probed
+    else:
+        try:
+            from src.settings import get_setting
+            cfg = (get_setting("image_model", "") or "").strip()
+            ids = [cfg] if cfg else []
+        except Exception:
+            ids = []
 
     _IMAGE_MODELS_CACHE[key] = (now, list(ids))
     return ids

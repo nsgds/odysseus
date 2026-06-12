@@ -360,9 +360,12 @@ def _parse_qualified_mcp_args(tool: str, content: str) -> tuple[Dict, Optional[s
 
 def _parse_generate_image(content: str) -> Dict:
     # Native tool-callers (supports_tools=True endpoints) deliver args as a JSON
-    # object string (function_call_to_tool_block's default serialization); fenced
-    # callers deliver the 4-line text form below. Accept both: JSON first, then
-    # fall back to line parsing so local/fenced models keep working.
+    # object string (function_call_to_tool_block's default serialization) and may
+    # include `model` (enum-constrained to installed models). Fenced/local callers
+    # deliver the positional text form: line 1 = prompt, line 2 = size, line 3 =
+    # quality — NO model line (the fenced prompt tells them not to name a model;
+    # the server auto-selects). Accept JSON first, else positional. A stray size
+    # token never lands in `model` this way, so a dropped line can't shift fields.
     stripped = content.strip()
     if stripped.startswith("{"):
         try:
@@ -378,7 +381,7 @@ def _parse_generate_image(content: str) -> Dict:
             pass
     lines = content.strip().split("\n")
     args = {"prompt": lines[0].strip() if lines else ""}
-    for i, key in enumerate(["model", "size", "quality"], 1):
+    for i, key in enumerate(["size", "quality"], 1):
         if len(lines) > i and lines[i].strip():
             args[key] = lines[i].strip()
     return args
