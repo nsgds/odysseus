@@ -359,6 +359,23 @@ def _parse_qualified_mcp_args(tool: str, content: str) -> tuple[Dict, Optional[s
 
 
 def _parse_generate_image(content: str) -> Dict:
+    # Native tool-callers (supports_tools=True endpoints) deliver args as a JSON
+    # object string (function_call_to_tool_block's default serialization); fenced
+    # callers deliver the 4-line text form below. Accept both: JSON first, then
+    # fall back to line parsing so local/fenced models keep working.
+    stripped = content.strip()
+    if stripped.startswith("{"):
+        try:
+            obj = json.loads(stripped)
+            if isinstance(obj, dict) and obj.get("prompt"):
+                args = {"prompt": str(obj["prompt"]).strip()}
+                for key in ("model", "size", "quality"):
+                    val = obj.get(key)
+                    if val:
+                        args[key] = str(val).strip()
+                return args
+        except (ValueError, TypeError):
+            pass
     lines = content.strip().split("\n")
     args = {"prompt": lines[0].strip() if lines else ""}
     for i, key in enumerate(["model", "size", "quality"], 1):

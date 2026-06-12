@@ -989,6 +989,23 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "generate_image",
+            "description": "Generate an AI image from a text prompt. Art, illustrations, photos.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "Description of the image to generate"},
+                    "model": {"type": "string", "description": "Image model name (optional; server default if omitted)"},
+                    "size": {"type": "string", "description": "Image dimensions as WxH, e.g. 1024x1024 (optional)"},
+                    "quality": {"type": "string", "description": "Image quality (optional)"},
+                },
+                "required": ["prompt"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "edit_image",
             "description": "Edit a gallery image: upscale, remove background, inpaint, or harmonize.",
             "parameters": {
