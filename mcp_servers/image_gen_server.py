@@ -26,12 +26,12 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="generate_image",
-            description="Generate an image using an image-capable model (e.g. gpt-image-1)",
+            description="Generate an image from a text prompt. The server selects the installed image model.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "Image description prompt"},
-                    "model": {"type": "string", "description": "Model name (auto-detects if omitted)"},
+                    "model": {"type": "string", "description": "Optional. Leave empty to use the server's configured image model; only set to a model the server actually has installed."},
                     "size": {"type": "string", "description": "Image size (default 1024x1024)"},
                     "quality": {"type": "string", "description": "Quality: low, medium, high, auto (default medium)"},
                 },
@@ -47,12 +47,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
     prompt = arguments.get("prompt", "")
-    model_spec = arguments.get("model", "")
+    requested_model = (arguments.get("model") or "").strip()
     size = arguments.get("size", "1024x1024")
     quality = arguments.get("quality", "medium")
 
     if not prompt:
-        return [TextContent(type="text", text="Error: Image prompt is required")]
+        raise ValueError("Image prompt is required")
 
     try:
         import httpx
@@ -60,28 +60,32 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         from src.ai_interaction import _resolve_model
 
         if not get_setting("image_gen_enabled", True):
-            return [TextContent(type="text", text="Error: Image generation is disabled by the administrator.")]
+            raise RuntimeError("Image generation is disabled by the administrator.")
 
         _settings = load_settings()
-
-        if not model_spec:
-            model_spec = _settings.get("image_model", "")
         if quality == "medium" and _settings.get("image_quality"):
             quality = _settings["image_quality"]
 
-        # Auto-detect best available image model
-        if not model_spec:
-            for candidate in ("gpt-image-1.5", "gpt-image-1", "dall-e-3"):
-                try:
-                    await asyncio.to_thread(_resolve_model, candidate)
-                    model_spec = candidate
-                    break
-                except ValueError:
-                    continue
-            if not model_spec:
-                return [TextContent(type="text", text="Error: No image model found. Configure one in Admin.")]
+        # Ordered model candidates: the requested name first (may be a stale or
+        # hallucinated guess), then the admin-configured model, then auto-detect
+        # names. Resolve the FIRST that actually exists, so a bad `model` arg
+        # gracefully falls back to the configured model instead of hard-failing.
+        candidates = []
+        for c in (requested_model, _settings.get("image_model", ""),
+                  "gpt-image-1.5", "gpt-image-1", "dall-e-3"):
+            c = (c or "").strip()
+            if c and c not in candidates:
+                candidates.append(c)
 
-        url, model_id, headers = await asyncio.to_thread(_resolve_model, model_spec)
+        url = model_id = headers = None
+        for cand in candidates:
+            try:
+                url, model_id, headers = await asyncio.to_thread(_resolve_model, cand)
+                break
+            except ValueError:
+                continue
+        if model_id is None:
+            raise RuntimeError("No image model found. Configure one in Admin → Image Generation.")
 
         is_gpt_image = "gpt-image" in model_id.lower()
         base_url = url.replace("/chat/completions", "").replace("/v1/messages", "").rstrip("/")
@@ -108,12 +112,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     error_text = err_json.get("error", {}).get("message", error_text) if isinstance(err_json.get("error"), dict) else str(err_json.get("error", error_text))
                 except Exception:
                     pass
-                return [TextContent(type="text", text=f"Error: Image generation failed ({resp.status_code}): {error_text}")]
+                raise RuntimeError(f"Image generation failed ({resp.status_code}): {error_text}")
 
             data = resp.json()
             images = data.get("data", [])
             if not images:
-                return [TextContent(type="text", text="Error: No images returned from API")]
+                raise RuntimeError("No images returned from API")
 
             img = images[0]
             image_url = None
@@ -150,7 +154,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             elif img.get("url"):
                 image_url = img["url"]
             else:
-                return [TextContent(type="text", text="Error: Unexpected image API response format")]
+                raise RuntimeError("Unexpected image API response format")
 
             # "Direct link:" rather than an "image_url:" label — small models copied the
             # label token ("image_url") into the link href, producing a broken link.
@@ -162,11 +166,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=result)]
 
     except httpx.TimeoutException:
-        return [TextContent(type="text", text="Error: Image generation timed out (300s)")]
-    except ValueError as e:
-        return [TextContent(type="text", text=f"Error: {e}")]
-    except Exception as e:
-        return [TextContent(type="text", text=f"Error: {e}")]
+        # Re-raise as a normal error so the SDK marks the result isError=True
+        # (-> exit_code=1), instead of a contradictory exit_code=0 + "Error:" text.
+        raise RuntimeError("Image generation timed out (300s)")
+    # Any other exception (bad config, backend down, RuntimeError raised above)
+    # propagates to the SDK's call_tool wrapper, which returns isError=True.
 
 
 async def run():

@@ -163,6 +163,69 @@ def _resolve_model(spec: str, owner: Optional[str] = None) -> Tuple[str, str, Di
         db.close()
 
 
+# Short cache so the per-request schema enum injection doesn't hit the DB /
+# image endpoints on every agent turn. Endpoints change rarely.
+_IMAGE_MODELS_CACHE: Dict[str, Tuple[float, list]] = {}
+_IMAGE_MODELS_TTL = 60.0
+
+
+def list_image_model_ids(owner: Optional[str] = None) -> list:
+    """Return the ids of image models the deployment actually has installed.
+
+    Queries enabled ``model_type=='image'`` endpoints' /models, plus the
+    admin-configured ``image_model`` (kept first). Used to enum-constrain the
+    generate_image tool's ``model`` param so the agent can't invent names the
+    backend doesn't have (which hard-fail at resolution). Best-effort: returns
+    [] on any error so callers fail open (no enum) rather than blocking the tool.
+    """
+    key = owner or ""
+    now = time.monotonic()
+    cached = _IMAGE_MODELS_CACHE.get(key)
+    if cached and (now - cached[0]) < _IMAGE_MODELS_TTL:
+        return list(cached[1])
+
+    ids: list = []
+    try:
+        from src.settings import get_setting
+        configured = (get_setting("image_model", "") or "").strip()
+        if configured:
+            ids.append(configured)
+    except Exception:
+        pass
+    try:
+        import httpx as _req
+        from src.database import SessionLocal, ModelEndpoint
+        from src.auth_helpers import owner_filter
+        _db = SessionLocal()
+        try:
+            q = _db.query(ModelEndpoint).filter(
+                ModelEndpoint.is_enabled == True,  # noqa: E712
+                ModelEndpoint.model_type == "image",
+            )
+            if owner:
+                q = owner_filter(q, ModelEndpoint, owner)
+            for ep in q.all():
+                base = ep.base_url.rstrip("/")
+                if not base.endswith("/v1"):
+                    base += "/v1"
+                try:
+                    r = _req.get(base + "/models", timeout=3)
+                    r.raise_for_status()
+                    for m in (r.json().get("data") or []):
+                        mid = m.get("id")
+                        if mid and mid not in ids:
+                            ids.append(mid)
+                except Exception:
+                    continue
+        finally:
+            _db.close()
+    except Exception:
+        pass
+
+    _IMAGE_MODELS_CACHE[key] = (now, list(ids))
+    return ids
+
+
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
