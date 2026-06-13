@@ -3276,15 +3276,11 @@ async def stream_agent_loop(
     _exhausted_rounds = False
 
     # Installed image models for the generate_image enum (Fix: stop the agent
-    # inventing model names). Computed ONCE per turn (turn-invariant) and off the
-    # event loop so a slow/down image endpoint can't stall it; the per-round
-    # schema injection below just reuses this. Empty on failure -> enum omitted.
-    _image_model_ids = []
-    try:
-        from src.ai_interaction import list_image_model_ids
-        _image_model_ids = await asyncio.to_thread(list_image_model_ids, owner)
-    except Exception as _img_e:
-        logger.debug(f"image-model list lookup skipped: {_img_e}")
+    # inventing model names). Resolved LAZILY — only the first round that actually
+    # sends generate_image triggers the (cached, off-event-loop) lookup, so the
+    # many turns that never touch images don't probe image endpoints at all.
+    # None = not yet computed; [] = computed but none found (enum omitted).
+    _image_model_ids = None
 
     for round_num in range(1, max_rounds + 1):
         round_response = ""
@@ -3343,14 +3339,24 @@ async def stream_agent_loop(
                     and t.get("name") not in disabled_tools
                 ]
             # Constrain generate_image's `model` param to the actually-installed
-            # image models (computed once per turn above) so the agent can't
-            # invent a name the backend lacks. Fails open if none are found.
-            if _image_model_ids and any(t.get("function", {}).get("name") == "generate_image" for t in all_tool_schemas):
-                try:
-                    from src.tool_schemas import with_image_model_enum
-                    all_tool_schemas = with_image_model_enum(all_tool_schemas, _image_model_ids)
-                except Exception as _enum_e:
-                    logger.debug(f"image-model enum injection skipped: {_enum_e}")
+            # image models so the agent can't invent a name the backend lacks.
+            # Only now — once we know generate_image is actually being sent this
+            # round — do we resolve the model list (lazily, at most once per turn).
+            # Fails open if none are found.
+            if any(t.get("function", {}).get("name") == "generate_image" for t in all_tool_schemas):
+                if _image_model_ids is None:
+                    try:
+                        from src.ai_interaction import list_image_model_ids
+                        _image_model_ids = await asyncio.to_thread(list_image_model_ids, owner)
+                    except Exception as _img_e:
+                        logger.debug(f"image-model list lookup skipped: {_img_e}")
+                        _image_model_ids = []
+                if _image_model_ids:
+                    try:
+                        from src.tool_schemas import with_image_model_enum
+                        all_tool_schemas = with_image_model_enum(all_tool_schemas, _image_model_ids)
+                    except Exception as _enum_e:
+                        logger.debug(f"image-model enum injection skipped: {_enum_e}")
         else:
             # Local: only MCP schemas when message suggests MCP tool usage
             _last_content = _last_user.lower()

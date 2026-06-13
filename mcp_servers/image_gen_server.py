@@ -50,6 +50,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     requested_model = (arguments.get("model") or "").strip()
     size = arguments.get("size", "1024x1024")
     quality = arguments.get("quality", "medium")
+    # Trusted owner injected by the tool-execution bridge (NOT a model-controlled
+    # schema field) — scopes endpoint resolution and the gallery row to the caller
+    # so a request never resolves against another user's private image endpoint.
+    owner = arguments.get("_owner") or None
 
     if not prompt:
         raise ValueError("Image prompt is required")
@@ -80,7 +84,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         url = model_id = headers = None
         for cand in candidates:
             try:
-                url, model_id, headers = await asyncio.to_thread(_resolve_model, cand)
+                url, model_id, headers = await asyncio.to_thread(_resolve_model, cand, owner=owner)
                 break
             except ValueError:
                 continue
@@ -145,6 +149,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         model=model_id,
                         size=size,
                         quality=payload.get("quality", "medium"),
+                        owner=owner,
                     ))
                     db.commit()
                     db.close()
