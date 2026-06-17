@@ -94,11 +94,43 @@ def test_mcp_image_server_threads_trusted_owner():
     assert "owner=owner," in src                       # GalleryImage tagged with the owner
 
 
-def test_bridge_injects_trusted_owner_for_generate_image_only():
-    """_call_mcp_tool injects `_owner` only for generate_image, gated by tool name."""
-    src = inspect.getsource(te._call_mcp_tool)
-    assert 'tool == "generate_image"' in src
-    assert '"_owner": owner' in src
+def test_bridge_applies_trusted_owner_via_helper():
+    """Both dispatch paths delegate owner enforcement to _apply_trusted_owner so they
+    scrub/inject identically: the builtin-name wrapper (_call_mcp_tool) and the generic
+    qualified mcp__ branch (_execute_tool_block_impl). Guards the #4123 P2 — a direct
+    `mcp__image_gen__generate_image` call must not bypass owner injection."""
+    assert "_apply_trusted_owner(tool, args, owner)" in inspect.getsource(te._call_mcp_tool)
+    assert "_apply_trusted_owner(tool, args, owner)" in inspect.getsource(te._execute_tool_block_impl)
+
+
+def test_apply_trusted_owner_qualified_image_call_cannot_spoof_owner():
+    """P2 regression (qualified name): a model-issued `mcp__image_gen__generate_image`
+    call carrying a spoofed `_owner` has it dropped and replaced with the trusted owner."""
+    qualified = "mcp__image_gen__generate_image"
+    assert qualified in te._OWNER_SCOPED_QUALIFIED
+    out = te._apply_trusted_owner(qualified, {"prompt": "a cat", "_owner": "attacker"}, "alice")
+    assert out["_owner"] == "alice"          # trusted owner wins
+    assert out["prompt"] == "a cat"          # real args preserved
+
+
+def test_apply_trusted_owner_builtin_name_cannot_spoof_owner():
+    """P1 path (builtin name): same scrub/inject for the friendly `generate_image` name."""
+    out = te._apply_trusted_owner("generate_image", {"_owner": "attacker"}, "alice")
+    assert out["_owner"] == "alice"
+
+
+def test_apply_trusted_owner_strips_owner_from_non_scoped_tool():
+    """A model-supplied `_owner` is never honoured for a non-owner-scoped mcp__ tool —
+    it's stripped, not re-injected (the field is server-side-only for any tool)."""
+    out = te._apply_trusted_owner("mcp__filesystem__read_file", {"path": "/x", "_owner": "attacker"}, "alice")
+    assert "_owner" not in out
+    assert out["path"] == "/x"
+
+
+def test_apply_trusted_owner_no_owner_strips_spoofed():
+    """With no trusted owner to inject, a spoofed `_owner` is still dropped."""
+    out = te._apply_trusted_owner("mcp__image_gen__generate_image", {"_owner": "attacker"}, None)
+    assert "_owner" not in out
 
 
 def test_resolve_model_isolates_private_image_endpoint_by_owner():

@@ -357,6 +357,31 @@ def _parse_qualified_mcp_args(tool: str, content: str) -> tuple[Dict, Optional[s
         return {}, None
     return parsed, None
 
+# Builtin tools that must run under the TRUSTED, server-side caller owner — never a
+# model-supplied one. The image generator resolves the caller's private endpoints/keys
+# and tags the gallery row with the owner, so `_owner` is a server-only arg.
+_OWNER_SCOPED_TOOLS = {"generate_image"}
+# Their fully-qualified mcp__ names, so a model that calls the tool by its qualified
+# name through the generic mcp__ dispatch path gets the same enforcement.
+_OWNER_SCOPED_QUALIFIED = {
+    f"mcp__{_MCP_TOOL_MAP[t][0]}__{_MCP_TOOL_MAP[t][1]}" for t in _OWNER_SCOPED_TOOLS
+}
+
+
+def _apply_trusted_owner(name: str, args: Dict, owner: Optional[str]) -> Dict:
+    """Enforce the trusted-owner contract for owner-scoped tools on BOTH dispatch
+    paths — the builtin name (via _call_mcp_tool) and a model-issued fully-qualified
+    ``mcp__…`` call. `_owner` is server-side-only: drop any model-supplied value, then
+    inject the trusted caller owner for owner-scoped tools. Without this a direct
+    ``mcp__image_gen__generate_image`` call could spoof `_owner` to resolve another
+    user's image endpoint/key and mis-tag the gallery row (#4123 review)."""
+    if not isinstance(args, dict):
+        return args
+    args = {k: v for k, v in args.items() if k != "_owner"}
+    if owner and (name in _OWNER_SCOPED_TOOLS or name in _OWNER_SCOPED_QUALIFIED):
+        args["_owner"] = owner
+    return args
+
 
 def _parse_generate_image(content: str) -> Dict:
     # Native tool-callers (supports_tools=True endpoints) deliver args as a JSON
@@ -479,14 +504,11 @@ async def _call_mcp_tool(
     server_id, tool_name = _MCP_TOOL_MAP[tool]
     qualified = f"mcp__{server_id}__{tool_name}"
     args = _build_mcp_args(tool, content)
-    # Inject the TRUSTED, server-side owner for owner-scoped MCP tools. The image
-    # generator must resolve the *caller's* endpoints (not whichever endpoint
-    # happens to resolve first) and tag the gallery row with the owner. This is
-    # set here — after arg parsing, never in the tool schema — so the model can't
-    # control or spoof it (a model-supplied "_owner" is dropped by _build_mcp_args
-    # and overwritten here).
-    if owner and tool == "generate_image":
-        args = {**args, "_owner": owner}
+    # Enforce the trusted, server-side owner for owner-scoped tools (the image
+    # generator must resolve the *caller's* endpoints and tag the gallery row with
+    # the owner, never a model-supplied value). Centralised in _apply_trusted_owner
+    # so the generic mcp__ path applies the identical scrub-and-inject (#4123 review).
+    args = _apply_trusted_owner(tool, args, owner)
     result = await mcp.call_tool(qualified, args)
 
     # If MCP server not connected, try direct fallback
@@ -961,6 +983,10 @@ async def _execute_tool_block_impl(
             if parse_error:
                 result = {"error": parse_error, "exit_code": 1}
             else:
+                # A model can issue a fully-qualified mcp__… call directly; apply the
+                # trusted-owner scrub/inject the builtin path uses so it can't spoof
+                # `_owner` on an owner-scoped builtin (e.g. mcp__image_gen__generate_image).
+                args = _apply_trusted_owner(tool, args, owner)
                 if tool.startswith("mcp__email__") and owner:
                     args = dict(args)
                     args[_EMAIL_MCP_OWNER_ARG] = owner
