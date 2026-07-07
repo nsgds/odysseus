@@ -151,6 +151,21 @@ scripts/check-docker-gpu.sh --enable-nvidia-overlay
 scripts/check-docker-gpu.sh --install-nvidia-toolkit --enable-nvidia-overlay
 ```
 
+> **WSL2 + snap Docker.** If `docker run --gpus all ...` fails with
+> `failed to fulfil mount request: open /usr/lib/wsl/lib/libdxcore.so: no
+> such file or directory`, check whether Docker was installed via `snap`
+> (`snap list docker`, or `docker info --format '{{.DockerRootDir}}'` reports
+> a path under `/var/snap/docker/`). Snap's confinement prevents Docker from
+> seeing the GPU library WSL2 injects at `/usr/lib/wsl/lib`, even though the
+> file exists on the host — installing or reconfiguring
+> `nvidia-container-toolkit` will not fix this, since the toolkit isn't the
+> problem. `scripts/check-docker-gpu.sh` detects this combination and calls
+> it out directly. The fix is to remove snap Docker and install the official
+> apt-based Docker Engine instead
+> ([docs.docker.com/engine/install](https://docs.docker.com/engine/install/)),
+> then re-run `nvidia-ctk runtime configure --runtime=docker` and restart
+> Docker.
+
 Safety notes:
 - The app never installs host GPU runtime automatically.
 - The app never edits `.env` automatically.
