@@ -214,16 +214,9 @@ _check_nvidia_smi() {
     echo
 }
 
-# Returns 1 if Docker is unavailable (callers should stop further GPU checks).
-# WSL2 only: Docker installed via snap confines the container runtime's mount
-# namespace, so it cannot see the GPU library WSL2 injects at
-# /usr/lib/wsl/lib/libdxcore.so even though the file exists on the host.
-# Symptom: `docker run --gpus all ...` fails with
-# "failed to fulfil mount request: open /usr/lib/wsl/lib/libdxcore.so: no
-# such file or directory". No nvidia-container-toolkit install or
-# `nvidia-ctk runtime configure` fixes this — the fix is to stop using the
-# snap package. DockerRootDir is the reliable way to tell: snap installs
-# report a path under /var/snap/docker/ instead of the normal /var/lib/docker.
+# WSL2 snap Docker cannot see /usr/lib/wsl/lib/libdxcore.so from its confined
+# namespace, so NVIDIA passthrough fails until the user switches to non-snap
+# Docker. DockerRootDir identifies snap installs more reliably than snap(8).
 _is_wsl() {
     grep -qi microsoft /proc/version 2>/dev/null && return 0
     [ -d /usr/lib/wsl ] && return 0
@@ -237,6 +230,7 @@ _is_docker_snap() {
     return 1
 }
 
+# Returns 1 if Docker is unavailable (callers should stop further GPU checks).
 _check_docker() {
     _info "Checking Docker..."
     if ! command -v docker >/dev/null 2>&1; then
