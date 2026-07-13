@@ -952,6 +952,39 @@ def _is_contextual_retry_continuation(messages: List[Dict], text: str) -> bool:
     return bool(_COOKBOOK_CONTEXT_RE.search(recent))
 
 
+def _assistant_recently_used_tools(messages: List[Dict], lookback: int = 4) -> set:
+    """Tool names used by the last ``lookback`` assistant turns.
+
+    An anaphoric follow-up ("do another", "reply to the next one too", "add a
+    couple more") refers to a just-completed tool action but contains no domain
+    keyword, so it matches nothing and hits the low_signal short-circuit that
+    strips every tool — leaving a small model to confabulate a fake action
+    instead of repeating the real one. Re-arming the domain of a recently-used
+    tool keeps that tool offered. Read from recorded ``tool_events`` metadata,
+    with a generated-image URL fallback (image tools don't always thread the
+    metadata into the message list).
+    """
+    used: set = set()
+    checked = 0
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        checked += 1
+        if checked > lookback:
+            break
+        events = (msg.get("metadata") or {}).get("tool_events") or []
+        if isinstance(events, list):
+            for e in events:
+                if isinstance(e, dict) and e.get("tool"):
+                    used.add(e["tool"])
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+        if "/api/generated-image/" in str(content or ""):
+            used.update(("generate_image", "edit_image"))
+    return used
+
+
 def _assistant_requested_followup(messages: List[Dict]) -> bool:
     """True when the previous assistant turn asked for missing task details.
 
@@ -1076,6 +1109,25 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
     if has(r"\bapi[ _]call\b", r"\bintegrations?\b",
            r"\b(?:home ?assistant|miniflux|gitea|linkding|jellyfin)\b"):
         domains.add("integrations")
+
+    # Anaphoric-follow-up re-arm (domain-agnostic). A vague reply right after a
+    # real tool turn ("do another", "reply to the next one too", "add a couple
+    # more") references the prior action only anaphorically — no keyword — so it
+    # matches no domain and would be stripped of every tool, leaving a small
+    # model to confabulate a fake action. If a recent assistant turn actually
+    # used a tool, re-arm that tool's domain so it stays offered, reusing the
+    # existing _DOMAIN_TOOL_MAP as the tool->domain map (no per-domain special
+    # casing). Deliberately narrow: only when THIS turn matched nothing (the
+    # keyword classifier already handled turns with their own intent, and
+    # widening every keyword-matched turn with historical domains would bloat
+    # tool selection), and not for explicit continuations, which already
+    # inherit recent context for both retrieval and domain matching.
+    if not continuation and not domains:
+        _recent_tools = _assistant_recently_used_tools(messages)
+        if _recent_tools:
+            for _dom, _dom_tools in _DOMAIN_TOOL_MAP.items():
+                if _recent_tools & _dom_tools:
+                    domains.add(_dom)
 
     low_signal = not continuation and not domains
     return {
