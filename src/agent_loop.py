@@ -318,6 +318,11 @@ _DOMAIN_RULES = {
 ## Integration/API rules
 - To query or control a configured service integration (Home Assistant, Miniflux, Gitea, Linkding, Jellyfin, or any other registered service), use `api_call` with the integration name, HTTP method, path, and optional JSON body.
 - Do not use shell, curl, or `app_api` to reach a user's connected integration when `api_call` is available.""",
+    "images": """\
+## Image rules
+- Use `generate_image` to create an image from a text prompt; make ONE call per image (call it twice to produce two images).
+- Use `edit_image` for an existing gallery image (upscale, remove background, inpaint, harmonize).
+- Do NOT use memory/notes tools to fulfil an image-generation request.""",
 }
 
 _DOMAIN_TOOL_MAP = {
@@ -332,6 +337,7 @@ _DOMAIN_TOOL_MAP = {
     "settings": {"manage_settings", "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens", "app_api"},
     "contacts": {"resolve_contact", "manage_contact"},
     "integrations": {"api_call"},
+    "images": {"generate_image", "edit_image"},
 }
 
 def _domain_rules_for_tools(tool_names: set) -> list[str]:
@@ -1076,6 +1082,14 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
     if has(r"\bapi[ _]call\b", r"\bintegrations?\b",
            r"\b(?:home ?assistant|miniflux|gitea|linkding|jellyfin)\b"):
         domains.add("integrations")
+    # Image generation/editing intent. Without this, image requests match no
+    # domain -> low_signal -> a FRESH first turn takes the direct no-tools reply
+    # path and generate_image never reaches the model (same failure shape as the
+    # api_call/#3794 note above). Lookbehinds keep software artifacts ("docker
+    # image", "disk image") out of the visual-media domain.
+    if has(r"(?<!docker )(?<!disk )\b(images?|pictures?|photos?|drawings?|draw|sketch|paint|paintings?|render|illustrations?|illustrate|artwork|portrait|wallpaper|logo|icon|avatar)\b",
+           r"\b(upscale|inpaint|remove (?:the )?background|rembg)\b"):
+        domains.add("images")
 
     low_signal = not continuation and not domains
     return {
