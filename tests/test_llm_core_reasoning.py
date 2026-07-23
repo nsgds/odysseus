@@ -236,3 +236,76 @@ def test_harmony_commentary_channel_no_marker_or_toolarg_leak(monkeypatch):
     assert "<|message|>" not in thinking + answer
     assert "commentary" not in answer
     assert "to=functions.web_search" not in thinking + answer
+
+
+# --- streaming live-display fold for message-directive models (_rc_is_md) ------
+# The reasoning-control resolver marks a model as message-directive; the stream
+# builder must (A) fold a bare orphan </think> even for an id outside
+# _THINKING_MODEL_PATTERNS, WITHOUT (B) disabling the well-formed <think>…</think>
+# content auto-detect (a regression an earlier seed-based fix introduced).
+
+_MSGDIR_URL = "http://nim-nano:8000/v1"
+
+
+def _seed_msgdir(model):
+    from core.database import SessionLocal, ModelEndpoint, Base, engine
+    from src.model_capabilities import REASONING_CONTROL_MESSAGE_DIRECTIVE as MD
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        db.query(ModelEndpoint).filter(ModelEndpoint.id == "rc-stream").delete(synchronize_session=False)
+        db.add(ModelEndpoint(id="rc-stream", name="s", base_url=_MSGDIR_URL, is_enabled=True,
+                             cached_models=json.dumps([model]),
+                             reasoning_controls=json.dumps({model: {"mechanism": MD, "values": {"on": "/think"}}})))
+        db.commit()
+    finally:
+        db.close()
+
+
+def _cleanup_msgdir():
+    from core.database import SessionLocal, ModelEndpoint
+    db = SessionLocal()
+    try:
+        db.query(ModelEndpoint).filter(ModelEndpoint.id == "rc-stream").delete(synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_stream_folds_orphan_closer_for_message_directive_model(monkeypatch):
+    # CASE A: a message-directive model (id NOT in _THINKING_MODEL_PATTERNS)
+    # emits a bare orphan </think> in the first content chunk → the live display
+    # folds it (prepends <think>) so the frontend renders the reasoning block.
+    model = "nemotron-nano-msgdir-a"
+    _seed_msgdir(model)
+    try:
+        deltas = _run_stream(model, [
+            'data: {"choices":[{"delta":{"content":"</think>\\n\\nThe answer is 4."}}]}',
+            "data: [DONE]",
+        ], monkeypatch)
+        regular = [d for d in deltas if not d.get("thinking")]
+        assert regular and regular[0]["delta"].lstrip().lower().startswith("<think>"), regular
+    finally:
+        _cleanup_msgdir()
+
+
+def test_stream_wellformed_block_not_leaked_for_message_directive_model(monkeypatch):
+    # CASE B (regression guard): a message-directive model emitting a WELL-FORMED
+    # <think>…</think> in the content stream must still route reasoning to the
+    # thinking channel — the content auto-detect must stay enabled (not disabled
+    # by seeding _thinking_model from _rc_is_md). Reasoning must not leak to
+    # visible content, and the raw <think> tag must never appear in a regular delta.
+    model = "nemotron-nano-msgdir-b"
+    _seed_msgdir(model)
+    try:
+        deltas = _run_stream(model, [
+            'data: {"choices":[{"delta":{"content":"<think>Reasoning here.</think>The answer is 4."}}]}',
+            "data: [DONE]",
+        ], monkeypatch)
+        thinking = [d for d in deltas if d.get("thinking")]
+        regular = [d for d in deltas if not d.get("thinking")]
+        assert thinking and "Reasoning here." in thinking[0]["delta"], thinking
+        assert regular and "The answer is 4." in regular[0]["delta"], regular
+        assert all("<think>" not in d["delta"] for d in regular), regular
+    finally:
+        _cleanup_msgdir()

@@ -1912,3 +1912,86 @@ def test_manual_refresh_timeout_keeps_cached_models_and_warns(monkeypatch):
     assert db.commits == 0
     assert response.headers["X-Model-Refresh-Status"] == "failed"
     assert "kept cached models" in response.headers["X-Model-Refresh-Warning"]
+
+
+# --- Reasoning-control PATCH/GET route wiring ---------------------------------
+# validate_control_spec is unit-tested in test_reasoning_control.py; these pin
+# the ROUTE glue in toggle_model_endpoint / list_model_endpoints that consumes
+# it. NB: toggle_model_endpoint reads the body only when content-length > 0, so
+# these requests must set that header or the body is silently ignored.
+
+_MD_SPEC = {"mechanism": "reasoning_message_directive", "values": {"on": "/think"}}
+
+
+def _reasoning_patch(monkeypatch, ep, body):
+    db = _PinnedFakeDb([ep])
+    monkeypatch.setattr(model_routes, "SessionLocal", lambda: db)
+    monkeypatch.setattr(model_routes, "require_admin", lambda request: None)
+    endpoint = _get_route("/api/model-endpoints/{ep_id}", "PATCH")
+    request = _PinnedFakeRequest(body=body, headers={"content-length": "1"})
+    return asyncio.run(endpoint("ep1", request))
+
+
+def test_patch_reasoning_controls_validates_and_persists(monkeypatch):
+    ep = _make_endpoint()
+    _reasoning_patch(monkeypatch, ep, {"reasoning_controls": {"m": _MD_SPEC}})
+    assert json.loads(ep.reasoning_controls) == {"m": _MD_SPEC}
+
+
+def test_patch_reasoning_controls_bad_spec_raises_400(monkeypatch):
+    ep = _make_endpoint()
+    with pytest.raises(HTTPException) as exc:
+        _reasoning_patch(monkeypatch, ep,
+                         {"reasoning_controls": {"m": {"mechanism": "reasoning_budget", "values": {"on": 0}}}})
+    assert exc.value.status_code == 400
+    assert "reasoning_controls[m]" in exc.value.detail
+    # rejected before the assignment/commit — nothing persisted
+    assert getattr(ep, "reasoning_controls", None) is None
+
+
+def test_patch_reasoning_controls_unhashable_mechanism_is_400_not_500(monkeypatch):
+    # A JSON list/dict mechanism must be a clean 400, not a TypeError -> 500.
+    ep = _make_endpoint()
+    with pytest.raises(HTTPException) as exc:
+        _reasoning_patch(monkeypatch, ep,
+                         {"reasoning_controls": {"m": {"mechanism": [], "values": {"on": "/think"}}}})
+    assert exc.value.status_code == 400
+
+
+def test_patch_reasoning_controls_empty_clears(monkeypatch):
+    ep = _make_endpoint(reasoning_controls=json.dumps({"m": _MD_SPEC}))
+    _reasoning_patch(monkeypatch, ep, {"reasoning_controls": {}})
+    assert ep.reasoning_controls is None
+
+
+def test_patch_reasoning_modes_keeps_only_on_off(monkeypatch):
+    ep = _make_endpoint()
+    _reasoning_patch(monkeypatch, ep,
+                     {"reasoning_modes": {"a": "on", "b": "auto", "c": "off", "d": "garbage"}})
+    assert json.loads(ep.reasoning_modes) == {"a": "on", "c": "off"}
+
+
+def test_patch_reasoning_modes_rejects_non_dict(monkeypatch):
+    # Symmetric with reasoning_controls: a non-dict body is a 400, not a silent no-op.
+    ep = _make_endpoint()
+    with pytest.raises(HTTPException) as exc:
+        _reasoning_patch(monkeypatch, ep, {"reasoning_modes": ["not", "a", "dict"]})
+    assert exc.value.status_code == 400
+
+
+def test_patch_reasoning_modes_empty_clears(monkeypatch):
+    ep = _make_endpoint(reasoning_modes=json.dumps({"m": "on"}))
+    _reasoning_patch(monkeypatch, ep, {"reasoning_modes": {}})
+    assert ep.reasoning_modes is None
+
+
+def test_get_surfaces_reasoning_maps(monkeypatch):
+    ep = _make_endpoint(reasoning_controls=json.dumps({"m": _MD_SPEC}),
+                        reasoning_modes=json.dumps({"m": "on"}))
+    db = _PinnedFakeDb([ep])
+    monkeypatch.setattr(model_routes, "SessionLocal", lambda: db)
+    monkeypatch.setattr(model_routes, "require_admin", lambda request: None)
+    endpoint = _get_route("/api/model-endpoints", "GET")
+    result = endpoint(_PinnedFakeRequest())
+    assert result[0]["reasoning_controls"] == {"m": _MD_SPEC}
+    assert result[0]["reasoning_modes"] == {"m": "on"}

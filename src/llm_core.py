@@ -120,20 +120,32 @@ def _stream_timeout(read_timeout) -> httpx.Timeout:
 
 # Cache for LLM responses
 def _get_cache_key(url: str, model: str, messages: List[Dict], 
-                   temperature: float, max_tokens: int) -> str:
-    """Generate cache key for LLM requests."""
+                   temperature: float, max_tokens: int,
+                   control_fragment: Optional[Dict] = None) -> str:
+    """Generate cache key for LLM requests.
+
+    ``control_fragment`` is the reasoning-control body fragment (if any) that
+    will be merged into the payload. A message-directive control changes the
+    messages (so the key diverges automatically), but a body fragment does
+    NOT — without keying it, requests differing only by reasoning mode would
+    share a cache entry (cross-mode poisoning, one layer below the mutation
+    the payload-parity tests pin). None keeps keys byte-identical to before.
+    """
     hashable_messages = []
     for msg in messages:
         sorted_items = tuple(sorted(msg.items()))
         hashable_messages.append(sorted_items)
     
-    content = json.dumps({
+    key_parts = {
         'url': url,
         'model': model, 
         'messages': hashable_messages,
         'temp': temperature,
         'max_tokens': max_tokens
-    }, sort_keys=True)
+    }
+    if control_fragment:
+        key_parts['control_fragment'] = control_fragment
+    content = json.dumps(key_parts, sort_keys=True)
     return hashlib.sha256(content.encode()).hexdigest()
 
 _response_cache = {}
@@ -418,6 +430,15 @@ def _get_http_client() -> httpx.AsyncClient:
 def _get_cached_response(cache_key: str) -> Optional[str]:
     """Get cached response if it exists."""
     return _response_cache.get(cache_key)
+
+def clear_response_cache() -> None:
+    """Drop all cached non-streaming responses. Call after a change that can flip
+    how a response is finalized without changing its cache key — notably a
+    reasoning-control edit: for the message-directive mechanism in auto mode the
+    messages+fragment are byte-identical, so two requests straddling a control
+    add/remove key the SAME entry while differing in whether the orphan-</think>
+    repair (_finalize_llm_response) applies."""
+    _response_cache.clear()
 
 def _set_cached_response(cache_key: str, response: str) -> None:
     """Store response in cache."""
@@ -1759,9 +1780,111 @@ def normalize_model_id(
             return a
     return None
 
+
+def _prepare_llm_messages(messages: List[Dict], model: str, url: str,
+                          endpoint_id: Optional[str] = None) -> Tuple[List[Dict], bool, Optional[Dict]]:
+    """Shared request-preparation boundary for the sync (llm_call), async
+    (llm_call_async) and streaming (_stream_llm_inner) builders.
+
+    Order matters:
+      1. sanitize — strip fields upstream providers reject;
+      2. consolidate system messages into one at the start — some models
+         (e.g. Qwen3.5) reject system messages that aren't first;
+      3. per-model reasoning control — Category #1: inject the "/think"
+         soft-switch for models that gate reasoning that way, when the
+         per-model preference is "on" (the other ecosystem categories are
+         catalogued in src/reasoning_control.py; body-field categories would
+         extend this boundary with a payload fragment).
+
+    Callers with a response cache MUST compute their cache key from the
+    returned list: the reasoning mutation is part of the request identity, so
+    requests differing only by reasoning mode never share a cache entry.
+    Re-preparing already-prepared messages is a no-op (every step is
+    idempotent), which the llm_call_async -> stream_llm delegation relies on.
+
+    Returns ``(prepared_messages, is_message_directive, body_fragment)``: the
+    ``is_message_directive`` bool (the model's declared mechanism is the message
+    directive) lets the cached builders arm the response-side repair
+    (_finalize_llm_response) only for those models; the fragment (template-kwarg
+    mechanism) is merged into OpenAI-compatible payloads by
+    _apply_reasoning_fragment and MUST be passed to _get_cache_key by the cached
+    builders.
+    """
+    messages_copy = _sanitize_llm_messages(messages)
+
+    sys_parts = []
+    non_sys = []
+    for m in messages_copy:
+        if m.get("role") == "system":
+            sys_parts.append(m.get('content') or '')
+        else:
+            non_sys.append(m)
+    if sys_parts:
+        messages_copy = [{"role": "system", "content": "\n\n".join(sys_parts)}] + non_sys
+    else:
+        messages_copy = non_sys
+
+    from src.reasoning_control import resolve_reasoning_controls, inject_directive
+    directive, fragment, is_message_directive = resolve_reasoning_controls(
+        model, url, endpoint_id=endpoint_id)
+    if directive:
+        inject_directive(messages_copy, directive)
+    # Arm the response-side repair whenever the model's mechanism is the
+    # message directive — a default-on message-directive model reasons (and can
+    # emit the parser-less orphan-closer shape) in auto mode with nothing
+    # injected, so the arm is mechanism-based, not "did we inject". The body
+    # fragment (template-kwarg mechanism) is applied to the payload by the
+    # builders (_apply_reasoning_fragment); cached builders MUST also pass it
+    # to _get_cache_key.
+    return messages_copy, is_message_directive, fragment
+
+
+def _apply_reasoning_fragment(payload: Dict, fragment: Optional[Dict]) -> None:
+    """Merge a reasoning-control body fragment into an OpenAI-compatible
+    payload, in place. The fragment shape is {outer: {inner: value}} — the
+    keys come from the model's registry-declared kwarg_path, the value from the
+    user preference; the request path never invents keys. Existing keys under
+    the outer object are preserved (update, not replace). No-op when None."""
+    if not fragment:
+        return
+    for outer, inner_map in fragment.items():
+        if isinstance(inner_map, dict):
+            existing = payload.get(outer)
+            if isinstance(existing, dict):
+                existing.update(inner_map)
+            else:
+                payload[outer] = dict(inner_map)
+        else:
+            payload[outer] = inner_map
+
+
+def _finalize_llm_response(response: str, is_message_directive: bool,
+                           out_of_band: bool = False) -> str:
+    """Response-side counterpart of _prepare_llm_messages for the cached
+    (non-streaming) builders: for a message-directive model, repair the
+    parser-less "orphan </think>" response shape into a well-formed <think>
+    block so downstream consumers (clean_thinking_for_save, strip_think, the
+    closed-block regexes) handle the reasoning they otherwise cannot see. The
+    streaming display path already folds this shape (server-side
+    empty-reasoning auto-detect plus the frontend's orphan-closer handling);
+    this is the non-streaming equivalent. Runs BEFORE _set_cached_response so
+    the cache holds the repaired form.
+
+    ``out_of_band=True`` means the serve delivered reasoning in a separate
+    reasoning_content field — content is already clean, so a literal
+    "</think>" in the answer is answer text and must not be repaired.
+    normalize_reasoning_response is itself a no-op when there is no orphan
+    closer, so arming on mechanism (rather than on "did we inject") is safe."""
+    if is_message_directive and not out_of_band:
+        from src.reasoning_control import normalize_reasoning_response
+        response = normalize_reasoning_response(response)
+    return response
+
+
 def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
              max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None, 
-             timeout: int = LLMConfig.DEFAULT_TIMEOUT, prompt_type: Optional[str] = None) -> str:
+             timeout: int = LLMConfig.DEFAULT_TIMEOUT, prompt_type: Optional[str] = None,
+             endpoint_id: Optional[str] = None) -> str:
     """Synchronous LLM call with optional prompt type enhancement."""
     h = _provider_headers(_detect_provider(url))
     # Tolerate headers that arrive as a JSON string (some sessions stored them
@@ -1775,23 +1898,11 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
     if isinstance(headers, dict):
         h.update(headers)
 
-    messages_copy = _sanitize_llm_messages(messages)
-
-    # Consolidate multiple system messages into one at the start.
-    sys_parts = []
-    non_sys = []
-    for m in messages_copy:
-        if m.get("role") == "system":
-            sys_parts.append(m.get('content') or '')
-        else:
-            non_sys.append(m)
-    if sys_parts:
-        messages_copy = [{"role": "system", "content": "\n\n".join(sys_parts)}] + non_sys
-    else:
-        messages_copy = non_sys
+    messages_copy, _rc_is_md, _rc_fragment = _prepare_llm_messages(messages, model, url, endpoint_id=endpoint_id)
 
     provider = _detect_provider(url)
-    cache_key = _get_cache_key(url, model, messages_copy, temperature, max_tokens)
+    cache_key = _get_cache_key(url, model, messages_copy, temperature, max_tokens,
+                               control_fragment=_rc_fragment)
     cached_response = _get_cached_response(cache_key)
     if cached_response:
         logger.debug(f"Returning cached response for key: {cache_key}")
@@ -1823,6 +1934,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
         _apply_local_generation_stability(payload, target_url, model)
+        _apply_reasoning_fragment(payload, _rc_fragment)
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
     try:
@@ -1833,6 +1945,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
     if not r.is_success:
         raise HTTPException(502, f"Upstream {target_url} -> {r.status_code}: {r.text}")
     data = r.json()
+    _oob_reasoning = False
     try:
         if provider == "anthropic":
             response = _parse_anthropic_response(data)
@@ -1840,6 +1953,10 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
             response = _parse_ollama_response(data)
         else:
             msg = data["choices"][0]["message"]
+            # A populated reasoning_content proves a parser-ful serve: the
+            # content field is already clean, so the orphan-closer repair must
+            # not touch it (a literal </think> in the answer is answer text).
+            _oob_reasoning = bool(msg.get("reasoning_content"))
             content = msg.get("content")
             if isinstance(content, list):
                 # Mistral structured content — extract thinking + text
@@ -1850,10 +1967,12 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
                     response = text_part or msg.get("reasoning_content") or ""
             else:
                 response = content or msg.get("reasoning_content") or ""
-        _set_cached_response(cache_key, response)
-        return response
     except Exception:
         raise HTTPException(502, f"Unexpected schema from {target_url}: {str(data)[:400]}")
+    # Outside the schema-error wrapper: repair (feature-gated) then cache.
+    response = _finalize_llm_response(response, _rc_is_md, out_of_band=_oob_reasoning)
+    _set_cached_response(cache_key, response)
+    return response
 
 
 def _dedupe_candidates(candidates):
@@ -1933,25 +2052,14 @@ async def llm_call_async(
     prompt_type: Optional[str] = None,
     session_id: Optional[str] = None,
     workload: str = "foreground",
+    endpoint_id: Optional[str] = None,
 ) -> str:
     """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
     provider = _detect_provider(url)
-    messages_copy = _sanitize_llm_messages(messages)
+    messages_copy, _rc_is_md, _rc_fragment = _prepare_llm_messages(messages, model, url, endpoint_id=endpoint_id)
 
-    # Consolidate multiple system messages into one at the start.
-    sys_parts = []
-    non_sys = []
-    for m in messages_copy:
-        if m.get("role") == "system":
-            sys_parts.append(m.get('content') or '')
-        else:
-            non_sys.append(m)
-    if sys_parts:
-        messages_copy = [{"role": "system", "content": "\n\n".join(sys_parts)}] + non_sys
-    else:
-        messages_copy = non_sys
-
-    cache_key = _get_cache_key(url, model, messages_copy, temperature, max_tokens)
+    cache_key = _get_cache_key(url, model, messages_copy, temperature, max_tokens,
+                               control_fragment=_rc_fragment)
     cached_response = _get_cached_response(cache_key)
     if cached_response:
         logger.debug(f"Returning cached response for key: {cache_key}")
@@ -1971,6 +2079,7 @@ async def llm_call_async(
             headers=headers,
             timeout=timeout,
             workload=workload,
+            endpoint_id=endpoint_id,
         ):
             event_is_error = False
             for line in str(chunk).splitlines():
@@ -1983,7 +2092,13 @@ async def llm_call_async(
                 if not raw:
                     continue
                 if raw == "[DONE]":
-                    response = "".join(parts)
+                    # Codex/ChatGPT delivers reasoning OUT-OF-BAND (only content
+                    # deltas are collected into `parts`), so the joined text is
+                    # already clean. Pass out_of_band=True to STRUCTURALLY
+                    # guarantee the orphan-</think> repair never fires here, even
+                    # if a message-directive control were declared for this model
+                    # — no longer relying on _rc_is_md happening to be False.
+                    response = _finalize_llm_response("".join(parts), _rc_is_md, out_of_band=True)
                     _set_cached_response(cache_key, response)
                     return response
                 try:
@@ -1997,7 +2112,7 @@ async def llm_call_async(
                 delta = data.get("delta")
                 if isinstance(delta, str):
                     parts.append(delta)
-        response = "".join(parts)
+        response = _finalize_llm_response("".join(parts), _rc_is_md, out_of_band=True)
         _set_cached_response(cache_key, response)
         return response
 
@@ -2037,6 +2152,7 @@ async def llm_call_async(
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
         _apply_local_cache_affinity(payload, url, session_id)
         _apply_local_generation_stability(payload, target_url, model)
+        _apply_reasoning_fragment(payload, _rc_fragment)
 
     if _is_host_dead(target_url):
         raise HTTPException(503, f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)")
@@ -2065,6 +2181,7 @@ async def llm_call_async(
             logger.info(f"LLM async call to {target_url} succeeded in {duration:.2f}s (attempt {attempt})")
             _clear_host_dead(target_url)
             data = r.json()
+            _oob_reasoning = False
             try:
                 if provider == "anthropic":
                     response = _parse_anthropic_response(data)
@@ -2072,11 +2189,16 @@ async def llm_call_async(
                     response = _parse_ollama_response(data)
                 else:
                     msg = data["choices"][0]["message"]
+                    # Populated reasoning_content = parser-ful serve; content is
+                    # already clean, so the orphan-closer repair must skip it.
+                    _oob_reasoning = bool(msg.get("reasoning_content"))
                     response = msg.get("content") or msg.get("reasoning_content") or ""
-                _set_cached_response(cache_key, response)
-                return response
             except Exception:
                 raise HTTPException(502, f"Unexpected schema from {target_url}: {str(data)[:400]}")
+            # Outside the schema-error wrapper: repair (feature-gated) then cache.
+            response = _finalize_llm_response(response, _rc_is_md, out_of_band=_oob_reasoning)
+            _set_cached_response(cache_key, response)
+            return response
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             _cooled = _mark_host_dead(target_url)
             duration = time.time() - start
@@ -2107,7 +2229,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                     tool_choice_none: bool = False, workload: str = "foreground"):
+                     tool_choice_none: bool = False, workload: str = "foreground",
+                     endpoint_id: Optional[str] = None):
     target_url = _stream_target_url(url)
     async with _local_model_slot(target_url, model, workload):
         async for chunk in _stream_llm_inner(
@@ -2122,6 +2245,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             tools=tools,
             session_id=session_id,
             tool_choice_none=tool_choice_none,
+            endpoint_id=endpoint_id,
         ):
             yield chunk
 
@@ -2130,7 +2254,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                             max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                             timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                             tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                            tool_choice_none: bool = False):
+                            tool_choice_none: bool = False, endpoint_id: Optional[str] = None):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -2140,21 +2264,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
       - data: [DONE]                       — end of stream
     """
     provider = _detect_provider(url)
-    messages_copy = _sanitize_llm_messages(messages)
-
-    # Consolidate multiple system messages into one at the start.
-    # Some models (e.g. Qwen3.5) reject system messages that aren't first.
-    sys_parts = []
-    non_sys = []
-    for m in messages_copy:
-        if m.get("role") == "system":
-            sys_parts.append(m.get('content') or '')
-        else:
-            non_sys.append(m)
-    if sys_parts:
-        messages_copy = [{"role": "system", "content": "\n\n".join(sys_parts)}] + non_sys
-    else:
-        messages_copy = non_sys
+    messages_copy, _rc_is_md, _rc_fragment = _prepare_llm_messages(messages, model, url, endpoint_id=endpoint_id)
 
     if provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
@@ -2205,6 +2315,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             payload["think"] = False
         _apply_local_cache_affinity(payload, url, session_id)
         _apply_local_generation_stability(payload, target_url, model)
+        _apply_reasoning_fragment(payload, _rc_fragment)
         h = _provider_headers(provider, headers)
         if provider == "copilot":
             from src.copilot import apply_request_headers
@@ -2463,7 +2574,13 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     _tc_acc: Dict[int, Dict] = {}  # index -> {id, name, arguments}
     _tc_last_idx = [-1]  # most-recently-touched slot, for providers that omit `index`
     # For thinking models: prepend <think> to first content delta so frontend
-    # can detect thinking-in-progress (some models output </think> but no <think>)
+    # can detect thinking-in-progress (some models output </think> but no <think>).
+    # A message-directive model (_rc_is_md) may sit outside _THINKING_MODEL_PATTERNS
+    # yet emit the parser-less orphan-</think> shape. We OR _rc_is_md into the
+    # orphan-fold conditions below (2607 / 2775) rather than into this SEED, so the
+    # well-formed <think>…</think> content auto-detect (gated on `not _thinking_model`)
+    # stays enabled for it — seeding True here would disable that auto-detect and
+    # leak a well-formed reasoning block (and its raw tag) to visible content.
     _thinking_model = _supports_thinking(model)
     _first_content_sent = False
     _in_think_tag = False        # True while consuming <think>…</think> content
@@ -2490,7 +2607,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             # Some thinking backends start normal content with a stray closing
             # tag. Repair only that shape; do not wrap every first token for
             # model families like MiniMax, which often stream ordinary answers.
-            if _thinking_model and not _first_content_sent and part.lstrip().lower().startswith("</think"):
+            if (_thinking_model or _rc_is_md) and not _first_content_sent and part.lstrip().lower().startswith("</think"):
                 part = "<think>" + part
             _first_content_sent = True
             events.append(_stream_delta_event(part))
@@ -2658,7 +2775,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                                     # stray closing tag. Repair only that shape; do not
                                                     # wrap every first token for model families like
                                                     # MiniMax, which often stream ordinary answers.
-                                                    if _thinking_model and not _first_content_sent and stripped.lower().startswith("</think"):
+                                                    if (_thinking_model or _rc_is_md) and not _first_content_sent and stripped.lower().startswith("</think"):
                                                         content = "<think>" + content
                                                     _first_content_sent = True
                                                     yield f'data: {json.dumps({"delta": content})}\n\n'
@@ -2838,10 +2955,18 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
                 # model's name (e.g. a Bedrock/Claude endpoint that 400s every
                 # request but appears fine because another model silently answered).
                 if i > 0:
+                    from core.log_safety import redact_url
                     yield ('data: ' + json.dumps({
                         "type": "fallback",
                         "selected_model": primary_model,
                         "answered_by": model,
+                        # The candidate's own endpoint, REDACTED (no userinfo/query/
+                        # fragment reaches the browser) — host+path is all the
+                        # save-boundary reasoning-control lookup needs, and it lets
+                        # the repair resolve the fallback's spec on ITS endpoint
+                        # rather than the primary session's. Additive; other
+                        # consumers ignore it (dict.get).
+                        "answered_endpoint_url": redact_url(url),
                         "reason": _summarize_stream_error(last_error),
                     }) + '\n\n')
                 # Metadata must not commit a candidate. Once real output arrives,

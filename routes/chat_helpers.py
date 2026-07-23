@@ -953,11 +953,54 @@ def _normalize_thinking(text: str) -> str:
     return text
 
 
-def _extract_thinking_meta(text: str) -> dict | None:
-    """Extract thinking content into metadata, return {thinking, reply, time} or None."""
+def _extract_thinking_meta(text: str, model: str | None = None,
+                           endpoint_url: str | None = None,
+                           reasoning_streamed: bool = False,
+                           requested_model: str | None = None) -> dict | None:
+    """Extract thinking content into metadata, return {thinking, reply, time} or None.
+
+    When `model` + `endpoint_url` identify a model whose declared control
+    mechanism is the message directive (see src.reasoning_control), the
+    parser-less "orphan </think>" shape is repaired into a well-formed block
+    first — such serves bake the opening tag into the prompt, so their
+    reasoning would otherwise be invisible to the extraction below and persist
+    into saved content (bloating every later turn's context). Template-kwarg
+    models deliver reasoning out-of-band so their content never carries a
+    closer (structural no-op); models with no control spec are untouched; a
+    truncated reasoning-only response has no closer either, preserving the
+    empty-reply guard below.
+
+    `reasoning_streamed=True` means reasoning already arrived out-of-band on this
+    turn (a parser-ful serve streamed reasoning_content separately). The content
+    is then clean answer text, so the orphan-closer repair is SKIPPED — mirroring
+    llm_core._finalize_llm_response's out_of_band guard. Without this, a
+    message-directive model on a parser-ful serve whose clean answer legitimately
+    contains a bare "</think>" (asking how think-blocks work, pasting model
+    output) would have that answer folded as thinking and truncated.
+    """
     import re
     if not text:
         return None
+    if model and not reasoning_streamed:
+        from src.reasoning_control import is_message_directive_model, normalize_reasoning_response
+        # Mechanism-scoped: only message-directive models produce the
+        # parser-less orphan-closer shape. Template-kwarg models (e.g. GLM)
+        # deliver reasoning out-of-band — their content never needs repair, and
+        # a literal "</think>" in their answers is answer text. reasoning_streamed
+        # covers the same out-of-band case for a message-directive model served
+        # by a parser-ful backend.
+        #
+        # Gate on the REQUEST-side identity, not only the server-reported one:
+        # the control map is keyed by the CONFIGURED id the admin PATCHed, but
+        # `model` here is the served/answered id, which differs on the
+        # server-rename path (the serve echoes a different name) and the
+        # fallback path (a different model on a different endpoint answered).
+        # Check both the configured id and the served id — missing either leaks
+        # a parser-less model's reasoning into saved content. Arming is safe:
+        # normalize_reasoning_response is a no-op without an orphan closer.
+        if (is_message_directive_model(requested_model or model, endpoint_url)
+                or is_message_directive_model(model, endpoint_url)):
+            text = normalize_reasoning_response(text)
     from src.text_helpers import normalize_thinking_markup
     original_text = text
     text = normalize_thinking_markup(text)
@@ -998,10 +1041,34 @@ def _extract_thinking_meta(text: str) -> dict | None:
     return None
 
 
-def clean_thinking_for_save(content: str, metadata: dict | None = None) -> tuple[str, dict]:
-    """Extract thinking from content into metadata. Use for save paths that bypass save_assistant_response."""
+def clean_thinking_for_save(content: str, metadata: dict | None = None,
+                            repair_model: str | None = None,
+                            repair_endpoint_url: str | None = None,
+                            reasoning_streamed: bool = False,
+                            repair_requested_model: str | None = None) -> tuple[str, dict]:
+    """Extract thinking from content into metadata. Use for save paths that bypass save_assistant_response.
+
+    `repair_model` (+ `repair_endpoint_url`) opts into the orphan-closer shape
+    repair (see _extract_thinking_meta) and must be passed ONLY for content
+    that arrived raw from a stream (e.g. stopped-mid-stream partials). Content
+    from the non-streaming builders was already adjudicated by
+    llm_core._finalize_llm_response with request context this boundary lacks
+    (out-of-band?) — repairing it again here would fold a parser-ful serve's
+    literal "</think>" answer text as thinking.
+
+    `repair_requested_model` is the CONFIGURED id the control map is keyed by
+    (the reasoning gate also tries it, so a server-rename / fallback whose
+    served id differs from the configured id is still repaired). `repair_model`
+    +`repair_endpoint_url` should be the model+endpoint that ACTUALLY answered.
+
+    `reasoning_streamed=True` (reasoning already arrived out-of-band this turn)
+    suppresses the repair for the same reason — pass it on the stopped-partial
+    paths, where the answer content is clean but a literal "</think>" in it must
+    not be repaired."""
     md = dict(metadata) if metadata else {}
-    info = _extract_thinking_meta(content)
+    info = _extract_thinking_meta(content, model=repair_model, endpoint_url=repair_endpoint_url,
+                                  reasoning_streamed=reasoning_streamed,
+                                  requested_model=repair_requested_model)
     if info:
         if info.get("thinking"):
             md["thinking"] = info["thinking"]
@@ -1026,8 +1093,15 @@ def save_assistant_response(
     do_research: bool = False,
     tool_events: list = None,
     incognito: bool = False,
+    endpoint_url: str | None = None,
 ):
-    """Add assistant response to session history. In incognito mode, keeps in-memory context but skips DB persistence."""
+    """Add assistant response to session history. In incognito mode, keeps in-memory context but skips DB persistence.
+
+    `endpoint_url` overrides the session's URL for the reasoning-control repair
+    lookup — pass the answering candidate's URL when a fallback served the turn,
+    so the orphan-closer repair resolves the fallback's spec (on its own
+    endpoint) rather than the primary session endpoint. Defaults to the
+    session URL when None, preserving every existing caller."""
     md = dict(last_metrics) if last_metrics else {}
     def _model_value(value) -> str:
         if value is None:
@@ -1057,8 +1131,15 @@ def save_assistant_response(
     if tool_events:
         md["tool_events"] = tool_events
 
-    # Extract thinking into metadata (don't pollute message content with <think> tags)
-    _think_info = _extract_thinking_meta(full_response)
+    # Extract thinking into metadata (don't pollute message content with <think> tags).
+    # If reasoning already arrived out-of-band this turn (md["thinking"] set from a
+    # parser-ful serve's streamed reasoning_content), skip the orphan-closer repair —
+    # the content is clean answer text and a literal "</think>" in it is not reasoning.
+    _think_info = _extract_thinking_meta(
+        full_response, model=actual_model or requested_model or None,
+        endpoint_url=endpoint_url if endpoint_url is not None else getattr(sess, "endpoint_url", None),
+        reasoning_streamed=bool(md.get("thinking")),
+        requested_model=requested_model or None)
     if _think_info:
         if _think_info.get("thinking"):
             md["thinking"] = _think_info["thinking"]

@@ -18,6 +18,19 @@ from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from core.database import SessionLocal, ModelEndpoint, Session as DbSession
 from core.log_safety import redact_url as _redact_url_for_log
+
+
+def _tolerant_json_map(raw) -> dict:
+    """Parse a JSON-object column defensively: one malformed row must not 500
+    the whole endpoints list (matches the tolerant parsing of the sibling
+    cached/hidden model-id columns)."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
 from core.middleware import require_admin
 from src.constants import COOKBOOK_STATE_FILE
 from src.llm_core import _detect_provider, _host_match, ANTHROPIC_MODELS
@@ -1914,6 +1927,8 @@ def setup_model_routes(model_discovery):
                     "ping_error": (ping or {}).get("error") if ping else None,
                     "model_type": getattr(r, "model_type", None) or "llm",
                     "supports_tools": getattr(r, "supports_tools", None),
+                    "reasoning_modes": _tolerant_json_map(getattr(r, "reasoning_modes", None)),
+                    "reasoning_controls": _tolerant_json_map(getattr(r, "reasoning_controls", None)),
                     "endpoint_kind": kind,
                     "category": _classify_endpoint(base, kind),
                     "model_refresh_mode": _endpoint_refresh_mode(r, kind),
@@ -2455,10 +2470,44 @@ def setup_model_routes(model_discovery):
             ep = db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).first()
             if not ep:
                 raise HTTPException(404, "Endpoint not found")
+            _reasoning_edited = False
             if body:
                 if "supports_tools" in body:
                     v = body["supports_tools"]
                     ep.supports_tools = {True: True, False: False, 'true': True, 'false': False, 1: True, 0: False}.get(v)
+                if "reasoning_modes" in body:
+                    # JSON map {model_id: "on"|"off"}; per-model "auto"/other values
+                    # dropped (= leave default). None/{} clears; a non-dict is rejected
+                    # — mirrors the reasoning_controls clear/reject semantics below.
+                    _reasoning_edited = True
+                    _rm = body["reasoning_modes"]
+                    if _rm in (None, {}):
+                        ep.reasoning_modes = None
+                    elif isinstance(_rm, dict):
+                        _clean = {str(k): val for k, val in _rm.items() if val in ("on", "off")}
+                        ep.reasoning_modes = json.dumps(_clean) if _clean else None
+                    else:
+                        raise HTTPException(400, "reasoning_modes must be an object mapping model ids to 'on'/'off'")
+                if "reasoning_controls" in body:
+                    _reasoning_edited = True
+                    # JSON map {model_id: {mechanism, values, kwarg_path?}} declaring HOW a
+                    # model toggles reasoning. Each spec is validated against the canonical
+                    # #2739 vocabulary; a bad spec is rejected (not silently dropped) so a
+                    # typo can't leave a model mysteriously un-toggleable.
+                    from src.reasoning_control import validate_control_spec
+                    _rc = body["reasoning_controls"]
+                    if _rc in (None, {}):
+                        ep.reasoning_controls = None
+                    elif isinstance(_rc, dict):
+                        _clean_controls = {}
+                        for _mid, _spec in _rc.items():
+                            _norm, _err = validate_control_spec(_spec)
+                            if _err:
+                                raise HTTPException(400, f"reasoning_controls[{_mid}]: {_err}")
+                            _clean_controls[str(_mid)] = _norm
+                        ep.reasoning_controls = json.dumps(_clean_controls) if _clean_controls else None
+                    else:
+                        raise HTTPException(400, "reasoning_controls must be an object mapping model ids to control specs")
                 if "is_enabled" in body:
                     v_ie = body['is_enabled']
                     ep.is_enabled = v_ie.lower() in ('true', '1', 'yes') if isinstance(v_ie, str) else bool(v_ie)
@@ -2504,6 +2553,14 @@ def setup_model_routes(model_discovery):
             db.commit()
             _invalidate_models_cache()
             _local_probe_cache["data"] = None
+            if _reasoning_edited:
+                # A reasoning-control add/remove flips whether the orphan-</think>
+                # repair is armed for a model, but a byte-identical non-streaming
+                # request keys the same response-cache entry (message-directive +
+                # auto mode leaves messages+fragment unchanged) — clear it so the
+                # next call re-finalizes.
+                from src.llm_core import clear_response_cache
+                clear_response_cache()
             return {
                 "id": ep.id,
                 "is_enabled": ep.is_enabled,

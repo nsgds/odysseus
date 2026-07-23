@@ -436,7 +436,7 @@ class ModelEndpoint(TimestampMixin, Base):
 
     id = Column(String, primary_key=True, index=True)
     name = Column(String, nullable=False)          # Display label, e.g. "Local vLLM", "OpenRouter"
-    base_url = Column(String, nullable=False)      # Base URL, e.g. "http://localhost:8002/v1"
+    base_url = Column(String, nullable=False, index=True)  # Base URL, e.g. "http://localhost:8002/v1"; indexed — resolved per-request by src/reasoning_control.py
     api_key = Column(EncryptedText, nullable=True)  # Optional provider API key, encrypted at rest
     is_enabled = Column(Boolean, default=True)
     hidden_models = Column(Text, nullable=True)    # JSON list of model IDs that failed probing
@@ -457,6 +457,16 @@ class ModelEndpoint(TimestampMixin, Base):
     # can be toggled per-endpoint in the UI. NULL = unknown, falls
     # back to the model-name keyword heuristic in agent_loop.py.
     supports_tools = Column(Boolean, nullable=True, default=None)
+    # Per-model reasoning preference: JSON map {model_id: "on"|"off"}. Absent or
+    # empty = "auto" (leave each model's default). Read per-request in
+    # src/reasoning_control.py.
+    reasoning_modes = Column(Text, nullable=True, default=None)
+    # Per-model reasoning-control spec: JSON map {model_id: {mechanism, values,
+    # kwarg_path?}} declaring HOW a model toggles reasoning (message directive
+    # or template kwarg). Absent for a model = not toggleable (the default; no
+    # model is inferred from its name). User-supplied evidence; validated by
+    # src/reasoning_control.validate_control_spec.
+    reasoning_controls = Column(Text, nullable=True, default=None)
     # Per-user ownership. NULL = legacy/shared (visible to every user) — this
     # is the historical default. When non-null, the model picker only shows
     # the endpoint to that user (admins always see everything).
@@ -1070,6 +1080,42 @@ def _migrate_add_supports_tools_column():
             conn.close()
         except Exception:
             pass
+
+
+def _migrate_add_reasoning_modes_column():
+    """Add reasoning_modes + reasoning_controls columns to model_endpoints if
+    missing, and index model_endpoints.base_url (resolved per-request by the
+    reasoning-control lookup in src/reasoning_control.py)."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(model_endpoints)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if columns and "reasoning_modes" not in columns:
+            conn.execute("ALTER TABLE model_endpoints ADD COLUMN reasoning_modes TEXT")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added 'reasoning_modes' column to model_endpoints")
+        if columns and "reasoning_controls" not in columns:
+            conn.execute("ALTER TABLE model_endpoints ADD COLUMN reasoning_controls TEXT")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added 'reasoning_controls' column to model_endpoints")
+        if columns:
+            # Existing DBs whose table pre-dates the index=True on base_url; a
+            # fresh DB gets the index from create_all. Idempotent.
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_model_endpoints_base_url ON model_endpoints(base_url)")
+            conn.commit()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"reasoning columns migration failed: {e}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _migrate_add_cached_models_column():
@@ -1935,6 +1981,7 @@ def init_db():
     _migrate_add_model_endpoint_owner_column()
     _migrate_add_provider_auth_id_column()
     _migrate_add_supports_tools_column()
+    _migrate_add_reasoning_modes_column()
     _migrate_add_task_run_model_column()
     _migrate_add_owner_column()
     _migrate_add_document_archived_column()

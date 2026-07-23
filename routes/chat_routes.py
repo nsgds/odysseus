@@ -1237,6 +1237,7 @@ def setup_chat_routes(
             elif chat_mode == "chat":
                 _chat_start = time.time()
                 _answered_by = None  # set if the selected model failed and a fallback answered
+                _answered_endpoint_url = None  # the fallback's own endpoint URL, for the reasoning-control repair lookup
                 _requested_model = sess.model
                 _actual_model = None
                 # ── Chat mode: call stream_llm directly, NO tools, NO document access ──
@@ -1272,8 +1273,11 @@ def setup_chat_routes(
                                     yield chunk
                                 elif data.get("type") == "fallback":
                                     # Selected model failed; a fallback answered.
-                                    # Forward the notice and remember the real model.
+                                    # Forward the notice and remember the real model
+                                    # AND its endpoint, so the save-boundary reasoning
+                                    # repair resolves the fallback's own spec.
                                     _answered_by = data.get("answered_by") or _answered_by
+                                    _answered_endpoint_url = data.get("answered_endpoint_url") or _answered_endpoint_url
                                     _actual_model = _actual_model or _answered_by
                                     data["selected_model"] = data.get("selected_model") or _requested_model
                                     yield chunk
@@ -1346,6 +1350,7 @@ def setup_chat_routes(
                                     used_memories=ctx.used_memories,
                                     do_research=effective_do_research,
                                     incognito=incognito,
+                                    endpoint_url=_answered_endpoint_url or getattr(sess, "endpoint_url", None),
                                 )
                                 if _saved_id:
                                     yield f'data: {json.dumps({"type": "message_saved", "id": _saved_id})}\n\n'
@@ -1369,6 +1374,10 @@ def setup_chat_routes(
                                 "model": _actual_model or _answered_by or _requested_model,
                                 "requested_model": _requested_model,
                             },
+                            repair_model=_actual_model or _answered_by or _requested_model,
+                            repair_endpoint_url=_answered_endpoint_url or getattr(sess, "endpoint_url", None),
+                            reasoning_streamed=bool(thinking_response),  # presence of out-of-band reasoning, not its stripped text
+                            repair_requested_model=_requested_model,
                         )
                         sess.add_message(ChatMessage("assistant", _stopped_content, metadata=_stopped_md))
                         if not incognito:
@@ -1381,6 +1390,7 @@ def setup_chat_routes(
                 _agent_rounds = 0
                 _agent_tool_calls = 0
                 _answered_by = None  # set if the selected model failed and a fallback answered
+                _answered_endpoint_url = None  # the fallback's own endpoint URL, for the reasoning-control repair lookup
                 _requested_model = sess.model
                 _actual_model = None
                 try:
@@ -1464,9 +1474,12 @@ def setup_chat_routes(
                                 elif data.get("type") == "fallback":
                                     # Selected model failed; a fallback answered.
                                     # Forward the notice and remember the real
-                                    # model so metrics reflect it, not the masked
-                                    # selected model.
+                                    # model + its endpoint so metrics reflect it,
+                                    # not the masked selected model, and the
+                                    # save-boundary reasoning repair resolves the
+                                    # fallback's own spec.
                                     _answered_by = data.get("answered_by") or _answered_by
+                                    _answered_endpoint_url = data.get("answered_endpoint_url") or _answered_endpoint_url
                                     _actual_model = _actual_model or _answered_by
                                     data["selected_model"] = data.get("selected_model") or _requested_model
                                     yield chunk
@@ -1504,6 +1517,7 @@ def setup_chat_routes(
                                     rag_sources=ctx.rag_sources,
                                     used_memories=ctx.used_memories,
                                     incognito=incognito,
+                                    endpoint_url=_answered_endpoint_url or getattr(sess, "endpoint_url", None),
                                 )
                                 if _saved_id:
                                     yield f'data: {json.dumps({"type": "message_saved", "id": _saved_id})}\n\n'
@@ -1538,6 +1552,10 @@ def setup_chat_routes(
                                     "model": _actual_model or _answered_by or _requested_model,
                                     "requested_model": _requested_model,
                                 },
+                                repair_model=_actual_model or _answered_by or _requested_model,
+                                repair_endpoint_url=_answered_endpoint_url or getattr(sess, "endpoint_url", None),
+                                reasoning_streamed=bool(thinking_response),  # presence of out-of-band reasoning, not its stripped text
+                                repair_requested_model=_requested_model,
                             )
                             sess.add_message(ChatMessage("assistant", _stopped_content2, metadata=_stopped_md2))
                             if not incognito:
