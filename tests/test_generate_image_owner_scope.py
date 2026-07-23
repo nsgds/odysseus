@@ -35,7 +35,7 @@ def test_server_uses_trusted_underscore_owner_not_model_owner():
     """`_owner` (trusted) wins; a model-supplied `owner` key is ignored."""
     captured = {}
 
-    def fake_resolve(spec, owner=None):
+    def fake_resolve(spec, owner=None, model_type=None):
         captured.setdefault("owner", owner)
         raise ValueError("short-circuit before any network call")
 
@@ -50,7 +50,7 @@ def test_server_ignores_model_owner_without_trusted_injection():
     """Without the bridge's `_owner`, a model-supplied `owner` does NOT scope resolution."""
     captured = {}
 
-    def fake_resolve(spec, owner=None):
+    def fake_resolve(spec, owner=None, model_type=None):
         captured.setdefault("owner", owner)
         raise ValueError("short-circuit")
 
@@ -90,7 +90,8 @@ def test_mcp_image_server_threads_trusted_owner():
     endpoint resolution and the gallery row."""
     src = inspect.getsource(srv.call_tool)
     assert 'arguments.get("_owner")' in src            # trusted owner, not a schema field
-    assert "asyncio.to_thread(_resolve_model, cand, owner=owner)" in src  # owner-scoped resolution (off-loop)
+    assert "asyncio.to_thread(_resolve_model, cand, owner=owner" in src  # owner-scoped resolution (off-loop)
+    assert "model_type=_mt" in src                     # #4123 image-capability gate (two-pass)
     assert "owner=owner," in src                       # GalleryImage tagged with the owner
 
 

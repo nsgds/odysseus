@@ -73,12 +73,49 @@ def set_rag_manager(rag_mgr, personal_docs_mgr=None):
 from src.endpoint_resolver import build_chat_url, build_headers, build_models_url, resolve_endpoint_runtime
 
 
-def _resolve_model(spec: str, owner: Optional[str] = None) -> Tuple[str, str, Dict]:
+def _extract_model_ids(data) -> list:
+    """Normalize a /models-style response body to a list of model ids across the
+    three shapes Odysseus endpoints return: a bare top-level list, the OpenAI
+    ``{"data": [{"id": ..}]}`` object, and the native-Ollama ``/api/tags``
+    ``{"models": [{"name": .., "model": ..}]}`` object (name preferred over model).
+
+    Returns raw ids in encounter order; callers dedup/match as they see fit. Total
+    and tolerant: non-dict entries are skipped, non-string id/name values are skipped
+    (so downstream ``.lower()`` matching can't raise), a non-list/dict body (None or a
+    scalar from a broken backend) yields ``[]``, and the Ollama ``models`` fallback
+    only runs for an object body (a bare list has no ``.get``).
+    """
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        items = data.get("data") or []
+    else:
+        return []
+    ids = [m["id"] for m in items
+           if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]]
+    if not ids and isinstance(data, dict):
+        ids = []
+        for m in (data.get("models") or []):
+            if not isinstance(m, dict):
+                continue
+            for v in (m.get("name"), m.get("model")):   # name preferred, model fallback
+                if isinstance(v, str) and v:
+                    ids.append(v)
+                    break
+    return ids
+
+
+def _resolve_model(spec: str, owner: Optional[str] = None,
+                   model_type: Optional[str] = None) -> Tuple[str, str, Dict]:
     """Resolve a model specifier to (endpoint_url, model_id, headers).
 
     Accepts:
       "model_name"              — searches all configured endpoints
       "model_name@endpoint_name" — looks up specific endpoint by display name
+
+    If ``model_type`` is given (e.g. "image"), only endpoints tagged with that
+    model_type are considered, so the image paths never bind a text/chat endpoint
+    that merely lists a matching model id (#4123 image-capability gate).
 
     Raises ValueError if model not found.
     """
@@ -100,6 +137,8 @@ def _resolve_model(spec: str, owner: Optional[str] = None) -> Tuple[str, str, Di
     db = SessionLocal()
     try:
         query = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)
+        if model_type:
+            query = query.filter(ModelEndpoint.model_type == model_type)
         if target_endpoint_name:
             query = query.filter(ModelEndpoint.name.ilike(f"%{target_endpoint_name}%"))
         if owner:
@@ -134,15 +173,7 @@ def _resolve_model(spec: str, owner: Optional[str] = None) -> Tuple[str, str, Di
                     if models_url:
                         r = httpx.get(models_url, headers=headers, timeout=5)
                         r.raise_for_status()
-                        data = r.json()
-                        items = data if isinstance(data, list) else (data.get("data") or [])
-                        model_ids = [m.get("id") for m in items if isinstance(m, dict) and m.get("id")]
-                        if not model_ids:
-                            model_ids = [
-                                m.get("name") or m.get("model")
-                                for m in (data.get("models") or [])
-                                if m.get("name") or m.get("model")
-                            ]
+                        model_ids = _extract_model_ids(r.json())
                     else:
                         model_ids = json.loads(ep.cached_models or "[]")
                 except Exception:
@@ -161,6 +192,33 @@ def _resolve_model(spec: str, owner: Optional[str] = None) -> Tuple[str, str, Di
         raise ValueError(f"Model '{spec}' not found on any configured endpoint")
     finally:
         db.close()
+
+
+def _resolve_image_capable(spec: str, owner: Optional[str] = None) -> Tuple[str, str, Dict]:
+    """Resolve ``spec`` for the IMAGE paths, preferring an image-tagged endpoint.
+
+    A plain ``_resolve_model(spec)`` binds the first enabled endpoint (DB order)
+    that lists a matching id, so a text/chat endpoint that merely advertises an
+    image-sounding id can win and then receive a POST to /images/generations
+    (#4123). This resolves image-first: ``model_type="image"`` first, then an
+    UNGATED pass only if no image-tagged endpoint serves ``spec`` — so an image
+    endpoint left tagged 'llm' (the add-endpoint form default) still resolves.
+
+    Returns (url, model_id, headers). Raises ValueError if nothing resolves.
+    Sync — callers offload via asyncio.to_thread, matching _resolve_model.
+
+    NOTE: this is the SINGLE-SPEC specialization. The multi-candidate image loops
+    (image_gen_server candidate loop, do_generate_image auto-detect) keep their
+    ``_mt``-outer / candidate-inner order (ALL candidates image-first, then all
+    ungated) on purpose — do NOT "DRY" them into ``for cand: _resolve_image_capable(cand)``,
+    which does per-candidate ungated fallback and silently reintroduces #4123.
+    """
+    for _mt in ("image", None):
+        try:
+            return _resolve_model(spec, owner=owner, model_type=_mt)
+        except ValueError:
+            continue
+    raise ValueError(f"Model '{spec}' not found on any configured endpoint")
 
 
 # Short cache so the per-request schema enum injection doesn't hit the DB /
@@ -209,9 +267,10 @@ def list_image_model_ids(owner: Optional[str] = None) -> list:
                         continue
                     r = _req.get(murl, headers=build_headers(api_key, base), timeout=3)
                     r.raise_for_status()
-                    for m in (r.json().get("data") or []):
-                        mid = m.get("id")
-                        if mid and mid.lower() not in seen:
+                    for mid in _extract_model_ids(r.json()):
+                        # _extract_model_ids guarantees non-empty strings, so a
+                        # falsy-guard is unnecessary here.
+                        if mid.lower() not in seen:
                             seen.add(mid.lower())
                             probed.append(mid)
                 except Exception:
@@ -997,15 +1056,21 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
     if quality == "medium" and _settings.get("image_quality"):
         quality = _settings["image_quality"]
 
-    # Auto-detect best available image model if still not set
+    # Auto-detect best available image model if still not set. Prefer an
+    # image-tagged endpoint (#4123 gate) so a text endpoint that merely lists a
+    # matching name can't win; fall back to an ungated pass so a legitimate image
+    # endpoint left tagged 'llm' (the add-endpoint form default) still resolves.
     if not model_spec:
-        for candidate in ("gpt-image-1.5", "gpt-image-1", "dall-e-3"):
-            try:
-                await asyncio.to_thread(_resolve_model, candidate, owner=owner)
-                model_spec = candidate
+        for _mt in ("image", None):
+            for candidate in ("gpt-image-1.5", "gpt-image-1", "dall-e-3"):
+                try:
+                    await asyncio.to_thread(_resolve_model, candidate, owner=owner, model_type=_mt)
+                    model_spec = candidate
+                    break
+                except ValueError:
+                    continue
+            if model_spec:
                 break
-            except ValueError:
-                continue
         # Fallback: find any locally registered image-type endpoint
         if not model_spec:
             try:
@@ -1028,9 +1093,7 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
                         try:
                             _r = _req.get(_ibase + "/models", timeout=3)
                             _r.raise_for_status()
-                            _data = _r.json()
-                            _ditems = _data if isinstance(_data, list) else (_data.get("data") or [])
-                            _mids = [m.get("id") for m in _ditems if isinstance(m, dict) and m.get("id")]
+                            _mids = _extract_model_ids(_r.json())
                             if _mids:
                                 model_spec = _mids[0]
                                 break
@@ -1043,9 +1106,12 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
         if not model_spec:
             return {"error": "No image model found. Configure one in Admin → Image Generation."}
 
-    # Resolve the model to find the right endpoint
+    # Resolve the model to find the right endpoint. Image-capability gated (#4123):
+    # prefer an image-tagged endpoint so a text/chat endpoint that merely lists this
+    # id can't bind here and get the /images/generations POST; fall back to ungated
+    # only if no image endpoint serves it (a legit endpoint left tagged 'llm').
     try:
-        url, model_id, headers = await asyncio.to_thread(_resolve_model, model_spec, owner=owner)
+        url, model_id, headers = await asyncio.to_thread(_resolve_image_capable, model_spec, owner=owner)
     except ValueError:
         return {"error": f"No endpoint found with image model '{model_spec}'. "
                 "Configure an OpenAI-compatible endpoint with image generation support."}

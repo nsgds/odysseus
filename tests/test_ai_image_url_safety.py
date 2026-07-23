@@ -41,7 +41,7 @@ def _patch_generation(monkeypatch, image_url):
     monkeypatch.setattr(
         ai_interaction,
         "_resolve_model",
-        lambda model_spec, owner=None: (
+        lambda model_spec, owner=None, model_type=None: (
             "https://api.openai.example/v1/chat/completions",
             "dall-e-3",
             {"Authorization": "Bearer test"},

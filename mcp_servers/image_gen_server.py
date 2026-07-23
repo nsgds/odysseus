@@ -81,13 +81,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if c and c not in candidates:
                 candidates.append(c)
 
+        # Prefer an image-tagged endpoint (#4123 gate) so a text/chat endpoint that
+        # merely lists a matching model id can't win the loop and get a POST to its
+        # /images/generations; fall back to an ungated pass so a legitimate image
+        # endpoint left tagged 'llm' (the add-endpoint form default) still resolves.
         url = model_id = headers = None
-        for cand in candidates:
-            try:
-                url, model_id, headers = await asyncio.to_thread(_resolve_model, cand, owner=owner)
+        for _mt in ("image", None):
+            for cand in candidates:
+                try:
+                    url, model_id, headers = await asyncio.to_thread(_resolve_model, cand, owner=owner, model_type=_mt)
+                    break
+                except ValueError:
+                    continue
+            if model_id is not None:
                 break
-            except ValueError:
-                continue
         if model_id is None:
             raise RuntimeError("No image model found. Configure one in Admin → Image Generation.")
 
